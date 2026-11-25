@@ -1,0 +1,9 @@
+[Unit]
+Description=Snapshot quotidien du NAS
+After=srv-storage.mount
+Requires=srv-storage.mount
+[Service]
+Type=oneshot
+Nice=15
+IOSchedulingClass=idle
+ExecStart=/usr/local/sbin/nas-snapshot

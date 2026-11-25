@@ -1,0 +1,19 @@
+[Unit]
+Description=App NAS (API + interface web)
+After=network-online.target srv-storage.mount smbd.service
+Wants=network-online.target
+
+[Service]
+User=nas
+Group=nas
+UMask=0007
+WorkingDirectory=/opt/nas-app
+ExecStart=/opt/nas-app/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8080 --proxy-headers --forwarded-allow-ips 127.0.0.1 --timeout-keep-alive 75 --no-access-log
+Restart=always
+RestartSec=3
+ProtectHome=yes
+PrivateTmp=yes
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

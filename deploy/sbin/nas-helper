@@ -1,0 +1,261 @@
+#!/usr/bin/python3 -I
+"""nas-helper — actions privilégiées pour l'app NAS (appelé via sudo par l'utilisateur 'nas').
+
+Liste blanche stricte d'actions, entrées validées. Ne jamais exécuter de shell.
+"""
+import json, os, re, subprocess, sys, pwd
+
+STORAGE = "/srv/storage"
+SHARES_JSON = "/var/lib/nas/samba-shares.json"
+SMB_SHARES_CONF = "/etc/samba/nas-shares.conf"
+USER_RE = re.compile(r"^[a-z][a-z0-9_-]{1,31}$")
+SHARE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _-]{0,40}$")
+PATH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _./-]{0,200}$")
+DEV_RE = re.compile(r"^sd[a-z]{1,2}$|^nvme\d+n\d+$")
+CID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$")
+RESERVED = {"root", "nas", "admin-sys", "daemon", "bin", "sys", "nobody", "www-data", "caddy"}
+
+
+def die(msg, code=2):
+    print(json.dumps({"ok": False, "error": msg}))
+    sys.exit(code)
+
+
+def run(cmd, inp=None, check=True):
+    r = subprocess.run(cmd, input=inp, capture_output=True, text=True)
+    if check and r.returncode != 0:
+        die(f"{cmd[0]} a échoué: {r.stderr.strip()[:500]}")
+    return r
+
+
+def check_user(u):
+    if not USER_RE.match(u) or u in RESERVED:
+        die("nom d'utilisateur invalide")
+    return u
+
+
+def user_exists(u):
+    try:
+        pwd.getpwnam(u)
+        return True
+    except KeyError:
+        return False
+
+
+def read_password():
+    pw = sys.stdin.readline().rstrip("\n")
+    if not (8 <= len(pw) <= 200) or "\n" in pw:
+        die("mot de passe invalide (8 caractères minimum)")
+    return pw
+
+
+# ---------- utilisateurs ----------
+def user_add(u):
+    check_user(u)
+    pw = read_password()
+    if not user_exists(u):
+        run(["useradd", "--no-create-home", "--home-dir", "/nonexistent", "--shell", "/usr/sbin/nologin",
+             "--gid", "nas", "--comment", "NAS user", u])
+    else:
+        if pwd.getpwnam(u).pw_shell != "/usr/sbin/nologin":
+            die("cet utilisateur système existe déjà")
+    run(["smbpasswd", "-s", "-a", u], inp=f"{pw}\n{pw}\n")
+    run(["smbpasswd", "-e", u])
+
+
+def user_passwd(u):
+    check_user(u)
+    pw = read_password()
+    run(["smbpasswd", "-s", "-a", u], inp=f"{pw}\n{pw}\n")
+
+
+def user_smb(u, state):
+    check_user(u)
+    run(["smbpasswd", "-e" if state == "on" else "-d", u], check=False)
+
+
+def user_rename(old, new):
+    """Renomme un compte : Linux, Samba (en gardant le hash du mot de passe), dossier perso, corbeilles, snapshots."""
+    check_user(old); check_user(new)
+    if not user_exists(old) or pwd.getpwnam(old).pw_shell != "/usr/sbin/nologin":
+        die("compte introuvable")
+    if user_exists(new):
+        die("cet identifiant existe déjà")
+    # hash NT du mot de passe Samba (format smbpasswd : nom:uid:LM:NT:flags:...)
+    line = run(["pdbedit", "-L", "-w", "-u", old]).stdout.strip()
+    parts = line.split(":")
+    nt, flags = parts[3], parts[4]
+    if not re.fullmatch(r"[0-9A-F]{32}", nt):
+        die("hash Samba introuvable")
+    run(["usermod", "-l", new, old])
+    run(["pdbedit", "-x", "-u", old], check=False)
+    tmp = os.urandom(12).hex() + "Aa1!"
+    run(["pdbedit", "-a", "-t", "-u", new], inp=f"{tmp}\n{tmp}\n")
+    run(["pdbedit", "-u", new, "--set-nt-hash", nt])
+    if "D" in flags:
+        run(["smbpasswd", "-d", new], check=False)
+    # dossier perso
+    src, dst = os.path.join(STORAGE, "users", old), os.path.join(STORAGE, "users", new)
+    if os.path.isdir(src) and not os.path.exists(dst):
+        os.rename(src, dst)
+    # corbeilles (.corbeille/<identifiant>) de tous les partages
+    for root, dirs, _ in os.walk(STORAGE):
+        if root.startswith(os.path.join(STORAGE, ".snapshots")):
+            dirs[:] = []
+            continue
+        if os.path.basename(root) == ".corbeille":
+            o, n = os.path.join(root, old), os.path.join(root, new)
+            if os.path.isdir(o) and not os.path.exists(n):
+                os.rename(o, n)
+            dirs[:] = []
+            continue
+        dirs[:] = [d for d in dirs if d not in ("lost+found",)]
+    # snapshots existants : l'ancien chemin reste lisible sous le nouveau nom (versions précédentes)
+    snaps = os.path.join(STORAGE, ".snapshots")
+    if os.path.isdir(snaps):
+        for d in os.listdir(snaps):
+            o, n = os.path.join(snaps, d, "users", old), os.path.join(snaps, d, "users", new)
+            if os.path.isdir(o) and not os.path.exists(n):
+                os.symlink(old, n)
+
+
+def user_del(u):
+    check_user(u)
+    run(["smbpasswd", "-x", u], check=False)
+    if user_exists(u) and pwd.getpwnam(u).pw_shell == "/usr/sbin/nologin":
+        run(["userdel", u], check=False)
+
+
+# ---------- samba ----------
+def esc_list(users):
+    out = []
+    for u in users:
+        check_user(u)
+        out.append(u)
+    return " ".join(out) if out else "nobody_nas_none"
+
+
+def samba_apply():
+    with open(SHARES_JSON) as f:
+        spec = json.load(f)
+    blocks = ["# Généré par nas-helper — ne pas modifier à la main\n"]
+    for s in spec:
+        name, path = s["name"], s["path"]
+        if not SHARE_RE.match(name) or not PATH_RE.match(path) or ".." in path.split("/"):
+            die(f"partage invalide: {name}")
+        full = os.path.realpath(os.path.join(STORAGE, path))
+        if not full.startswith(STORAGE + "/"):
+            die("chemin hors stockage")
+        os.makedirs(full, exist_ok=True)
+        os.chown(full, pwd.getpwnam("nas").pw_uid, pwd.getpwnam("nas").pw_gid)
+        os.chmod(full, 0o2770)
+        rw, ro = s.get("write", []), s.get("read", [])
+        b = [f"[{name}]",
+             f"   path = {full}",
+             f"   valid users = {esc_list(sorted(set(rw) | set(ro)))}",
+             f"   write list = {esc_list(rw)}",
+             "   read only = yes",
+             "   browseable = yes"]
+        if s.get("timemachine"):
+            size = int(s.get("tm_size_gb", 1000))
+            b += ["   fruit:time machine = yes", f"   fruit:time machine max size = {size}G",
+                  "   vfs objects = catia fruit streams_xattr"]
+        else:
+            b += ["   vfs objects = catia fruit streams_xattr recycle",
+                  "   recycle:repository = .corbeille/%U",
+                  "   recycle:keeptree = yes", "   recycle:versions = yes",
+                  "   recycle:touch = yes", "   recycle:directory_mode = 2770",
+                  "   recycle:exclude = *.tmp,~$*,.DS_Store",
+                  "   hide files = /.corbeille/"]
+        blocks.append("\n".join(b) + "\n")
+    tmp = SMB_SHARES_CONF + ".new"
+    with open(tmp, "w") as f:
+        f.write("\n".join(blocks))
+    os.replace(tmp, SMB_SHARES_CONF)
+    r = run(["testparm", "-s", "--suppress-prompt"], check=False)
+    if r.returncode != 0:
+        die("configuration Samba invalide: " + r.stderr[-400:])
+    run(["smbcontrol", "smbd", "reload-config"], check=False)
+
+
+def fix_perms(path):
+    if not PATH_RE.match(path) or ".." in path.split("/"):
+        die("chemin invalide")
+    full = os.path.realpath(os.path.join(STORAGE, path))
+    if not full.startswith(STORAGE + "/") or full.startswith(STORAGE + "/.snapshots"):
+        die("chemin hors stockage")
+    os.makedirs(full, exist_ok=True)
+    run(["chown", "-R", "nas:nas", full])
+    run(["chmod", "-R", "u+rwX,g+rwX,o-rwx", full])
+    run(["find", full, "-type", "d", "-exec", "chmod", "g+s", "{}", "+"])
+
+
+# ---------- infos système ----------
+def smart(dev):
+    if not DEV_RE.match(dev):
+        die("disque invalide")
+    r = run(["smartctl", "-j", "-a", f"/dev/{dev}"], check=False)
+    print(r.stdout)
+
+
+def mdadm():
+    out = {}
+    for md in sorted(os.listdir("/dev")):
+        if re.match(r"^md\d+$", md):
+            out[md] = run(["mdadm", "--detail", f"/dev/{md}"], check=False).stdout
+    print(json.dumps(out))
+
+
+def tailscale_status():
+    r = run(["tailscale", "status", "--json"], check=False)
+    print(r.stdout or "{}")
+
+
+# ---------- docker ----------
+def docker(action, cid=None):
+    if action == "ps":
+        r = run(["docker", "ps", "-a", "--no-trunc", "--format", "{{json .}}"], check=False)
+        print(json.dumps([json.loads(l) for l in r.stdout.splitlines() if l.strip()]))
+        return
+    if not cid or not CID_RE.match(cid):
+        die("conteneur invalide")
+    if action in ("start", "stop", "restart"):
+        run(["docker", action, cid])
+    elif action == "logs":
+        r = run(["docker", "logs", "--tail", "300", "--timestamps", cid], check=False)
+        print((r.stdout + r.stderr)[-200000:])
+    else:
+        die("action docker inconnue")
+
+
+def main():
+    a = sys.argv[1:]
+    if not a:
+        die("aucune action")
+    cmd, args = a[0], a[1:]
+    table = {
+        "user-add": (user_add, 1), "user-passwd": (user_passwd, 1), "user-del": (user_del, 1), "user-rename": (user_rename, 2),
+        "user-smb": (user_smb, 2), "samba-apply": (samba_apply, 0), "fix-perms": (fix_perms, 1),
+        "smart": (smart, 1), "mdadm": (mdadm, 0), "tailscale-status": (tailscale_status, 0),
+        "docker": (docker, None), "snapshot": (None, 0),
+    }
+    if cmd not in table:
+        die("action inconnue")
+    fn, n = table[cmd]
+    if cmd == "snapshot":
+        run(["systemctl", "start", "--no-block", "nas-snapshot.service"])
+        print(json.dumps({"ok": True}))
+        return
+    if n is not None and len(args) != n:
+        die("mauvais nombre d'arguments")
+    if cmd == "user-smb" and args[1] not in ("on", "off"):
+        die("état invalide")
+    if cmd == "docker" and not (1 <= len(args) <= 2):
+        die("mauvais nombre d'arguments")
+    fn(*args)
+    if cmd not in ("smart", "mdadm", "tailscale-status", "docker"):
+        print(json.dumps({"ok": True}))
+
+
+if __name__ == "__main__":
+    main()

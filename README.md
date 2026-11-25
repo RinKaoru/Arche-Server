@@ -37,6 +37,21 @@ consumer cloud services your family already knows.
 - Samba, Caddy, smartmontools, mdadm (if you use RAID), systemd timers
 - A storage directory (default `/srv/storage`) on a disk or RAID array
 
+## Installation (manual, for now)
+
+The `deploy/` folder holds the pieces that run outside the app:
+
+| Path | Goes to | What it does |
+|------|---------|--------------|
+| `deploy/sbin/nas-helper` | `/usr/local/sbin/nas-helper` | Root actions, whitelisted. The app calls it through sudo. |
+| `deploy/sudoers/nas-helper` | `/etc/sudoers.d/nas-helper` | Lets the `nas` user run only that helper as root. |
+| `deploy/sbin/nas-snapshot`, `nas-sysbackup`, `nas-alert` | `/usr/local/sbin/`, `/usr/local/bin/` | Daily snapshots, system backup, alert log |
+| `deploy/systemd/*` | `/etc/systemd/system/` | App service, snapshot timer, Syncthing service |
+
+Assumed layout: the app in `/opt/nas-app`, a `nas` system user, the data disk mounted on `/srv/storage`,
+state in `/var/lib/nas`. Adjust the units if yours differ. Then run `systemctl daemon-reload` and
+`python -m app.bootstrap`.
+
 ## Configuration (environment variables)
 | Variable | Default | Purpose |
 |----------|---------|---------|
@@ -58,7 +73,7 @@ and delete that file.
 ## Security notes
 - Admin pages and API keys are reachable only from the home network. Remote access should go through
   HTTPS plus two-factor authentication, or through a VPN.
-- `nas-helper` runs as root through a narrow `sudo` rule. Review it before you install it.
+- `nas-helper` runs as root through a narrow `sudo` rule (`deploy/sudoers/nas-helper`). Review it before you install it.
 - Never commit `.env` files, keys or the `identifiants-*.txt` file. `.gitignore` covers the usual ones.
 
 ## Roadmap

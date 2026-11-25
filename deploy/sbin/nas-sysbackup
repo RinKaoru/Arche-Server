@@ -1,0 +1,24 @@
+#!/bin/bash
+# Sauvegarde nocturne du disque système (SSD) vers le RAID :
+# base de l'app, configs, scripts, comptes Linux/Samba, certificats.
+# -> /srv/storage/.nas/systeme/systeme-AAAA-MM-JJ.tar.zst (root uniquement, 30 conservées)
+# Restauration : tar --zstd -xpf <archive> -C /   (puis systemctl restart nas-app smbd caddy)
+set -euo pipefail
+DST=/srv/storage/.nas/systeme
+mountpoint -q /srv/storage || { /usr/local/bin/nas-alert "Sauvegarde système : RAID non monté"; exit 1; }
+install -d -m 700 -o root -g root "$DST"
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+# copie cohérente de la base SQLite (WAL) + passdb Samba
+mkdir -p "$TMP/var/lib/nas" "$TMP/var/lib/samba/private"
+sqlite3 /var/lib/nas/nas.db ".backup '$TMP/var/lib/nas/nas.db'"
+for f in /var/lib/samba/private/*.tdb; do tdbbackup -s .bak "$f" >/dev/null 2>&1 && mv "$f.bak" "$TMP/var/lib/samba/private/$(basename "$f")" || cp -a "$f" "$TMP/var/lib/samba/private/"; done
+OUT="$DST/systeme-$(date +%F).tar.zst"
+tar --zstd -cpf "$OUT.partial" --ignore-failed-read \
+  --exclude=/var/lib/nas/nas.db --exclude=/var/lib/nas/nas.db-wal --exclude=/var/lib/nas/nas.db-shm \
+  --exclude=/var/lib/nas/thumbs --exclude='/var/lib/nas/syncthing/index-v*' --exclude='__pycache__' --exclude=/opt/nas-app/venv \
+  /etc /opt/nas-app /var/lib/nas /usr/local/sbin /usr/local/bin \
+  /var/lib/tailscale \
+  -C "$TMP" var/lib/nas/nas.db var/lib/samba/private
+mv "$OUT.partial" "$OUT"; chmod 600 "$OUT"
+ls -1t "$DST"/systeme-*.tar.zst | tail -n +31 | xargs -r rm -f
+echo "ok $(date -Iseconds) $(du -h "$OUT" | cut -f1)" > /var/lib/nas/sysbackup-state

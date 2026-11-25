@@ -1,0 +1,28 @@
+[Unit]
+Description=Synchronisation des PC et téléphones (Syncthing, piloté par Arche)
+After=network-online.target srv-storage.mount
+Wants=network-online.target
+RequiresMountsFor=/srv/storage
+
+[Service]
+User=nas
+Group=nas
+UMask=0007
+Environment=STNODEFAULTFOLDER=1 STNOUPGRADE=1
+# interface/API uniquement en local : Arche la pilote, rien n'est exposé
+ExecStart=/usr/bin/syncthing serve --no-browser --no-restart --logflags=0 --home=/var/lib/nas/syncthing --gui-address=127.0.0.1:8384
+Restart=on-failure
+RestartSec=5
+SuccessExitStatus=3 4
+RestartForceExitStatus=3 4
+Nice=5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/nas/syncthing /srv/storage
+
+[Install]
+WantedBy=multi-user.target

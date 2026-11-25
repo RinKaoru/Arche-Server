@@ -1,0 +1,39 @@
+#!/bin/bash
+# Snapshots quotidiens (hardlinks) de /srv/storage -> /srv/storage/.snapshots/AAAA-MM-JJ
+# Rétention : 7 quotidiens, 4 hebdo (dimanche), 6 mensuels (le 1er).
+# Exclus : médias (réimportables), Time Machine, corbeilles, docker.
+set -uo pipefail
+SRC=/srv/storage
+DST=/srv/storage/.snapshots
+STATE=/var/lib/nas/snapshot-state.json
+mkdir -p "$DST"; chmod 750 "$DST"; chown root:nas "$DST"
+TODAY=$(date +%F)
+LAST=$(ls -1 "$DST" 2>/dev/null | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' | grep -v "$TODAY" | sort | tail -1)
+LINK=(); [ -n "$LAST" ] && LINK=(--link-dest="$DST/$LAST")
+/usr/local/sbin/nas-sysbackup || /usr/local/bin/nas-alert "Sauvegarde système du $TODAY en échec"
+START=$(date +%s)
+rsync -a --delete --numeric-ids "${LINK[@]}" \
+  --exclude='/.snapshots/' --exclude='/medias/' --exclude='/backups/timemachine/' \
+  --exclude='/lost+found/' --exclude='.corbeille/' --exclude='/.nas/tmp/' --exclude='/.nas/cache/' --exclude='/.nas/systeme/' \
+  "$SRC/" "$DST/$TODAY.partial/" 2>/var/lib/nas/snapshot-last.err
+RC=$?
+if [ $RC -eq 0 ] || [ $RC -eq 24 ]; then
+  rm -rf "$DST/$TODAY"; mv "$DST/$TODAY.partial" "$DST/$TODAY"; OK=true
+else
+  OK=false
+fi
+# Rétention
+KEEP=$( { ls -1 "$DST" | grep -E '^[0-9-]{10}$' | sort -r | head -7
+          for d in $(ls -1 "$DST" | grep -E '^[0-9-]{10}$'); do
+            [ "$(date -d "$d" +%u)" = 7 ] && echo "$d"; done | sort -r | head -4
+          for d in $(ls -1 "$DST" | grep -E '^[0-9-]{10}$'); do
+            [ "$(date -d "$d" +%d)" = 01 ] && echo "$d"; done | sort -r | head -6; } | sort -u)
+for d in $(ls -1 "$DST" | grep -E '^[0-9-]{10}$'); do
+  echo "$KEEP" | grep -qx "$d" || rm -rf "$DST/$d"
+done
+rm -rf "$DST"/*.partial 2>/dev/null
+chmod -R g+rX "$DST" 2>/dev/null; chgrp nas "$DST"/* 2>/dev/null
+printf '{"date":"%s","ok":%s,"rc":%d,"seconds":%d,"snapshots":%d}\n' \
+  "$(date -Iseconds)" "$OK" "$RC" "$(( $(date +%s)-START ))" "$(ls -1 "$DST" | wc -l)" > "$STATE"
+chown nas:nas "$STATE"
+$OK || /usr/local/bin/nas-alert "Snapshot du $TODAY en échec (rsync code $RC)"

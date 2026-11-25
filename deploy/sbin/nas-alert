@@ -1,0 +1,6 @@
+#!/bin/sh
+# Point central d'alertes (smartd / mdadm). Journal + fichier lu par l'app NAS.
+msg="${SMARTD_MESSAGE:-$*}"
+mkdir -p /var/lib/nas
+echo "$(date -Iseconds) ${SMARTD_DEVICE:-raid} $msg" >> /var/lib/nas/alerts.log
+logger -t nas-alert "$msg"
